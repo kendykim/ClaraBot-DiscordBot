@@ -136,6 +136,7 @@ namespace Clara_bot
             services.AddSingleton<ResilientPlaybackRouter>();
             services.AddSingleton<BotLoggingService>();
             services.AddSingleton<LavalinkHealthMonitor>();
+            services.AddSingleton<LavalinkPlaybackEvents>();
 
 
 
@@ -159,6 +160,7 @@ namespace Clara_bot
 
             var client = serviceProvider.GetRequiredService<DiscordSocketClient>();
             var audioService = serviceProvider.GetRequiredService<IAudioService>();
+            _ = serviceProvider.GetRequiredService<LavalinkPlaybackEvents>();
             var commandHandler = serviceProvider.GetRequiredService<CommandHandler>();
             var loggingService = serviceProvider.GetRequiredService<BotLoggingService>();
             var reconnectLock = new SemaphoreSlim(1, 1);

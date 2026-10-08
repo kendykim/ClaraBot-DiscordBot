@@ -14,6 +14,7 @@ using Lavalink4NET.Extensions;
 using Lavalink4NET.Players;
 using Lavalink4NET.Rest.Entities.Tracks;
 using Lavalink4NET.Filters;
+using Lavalink4NET.Protocol.Payloads.Events;
 using System.Diagnostics;
 
 namespace Clara_bot.Commands
@@ -32,6 +33,7 @@ namespace Clara_bot.Commands
         private readonly IAudioService _audioService;
         private readonly LavalinkErrorHandler _errorHandler;
         private readonly ResilientPlaybackRouter _playbackRouter;
+        private readonly LavalinkPlaybackEvents _playbackEvents;
 
         private sealed class SearchResult
         {
@@ -67,6 +69,7 @@ namespace Clara_bot.Commands
             public ulong TextChannelId { get; init; }
             public int Index { get; set; }
             public int RequestedIndex { get; set; }
+            public int PendingLoaders { get; set; }
             public bool LoopEnabled { get; set; }
             public int ConsecutivePlaybackFailures { get; set; }
         }
@@ -75,12 +78,14 @@ namespace Clara_bot.Commands
             IAudioService audioService,
             DiscordSocketClient client,
             LavalinkErrorHandler errorHandler,
-            ResilientPlaybackRouter playbackRouter)
+            ResilientPlaybackRouter playbackRouter,
+            LavalinkPlaybackEvents playbackEvents)
         {
             _audioService = audioService;
             _client = client;
             _errorHandler = errorHandler;
             _playbackRouter = playbackRouter;
+            _playbackEvents = playbackEvents;
         }
 
         private readonly DiscordSocketClient _client;
@@ -547,7 +552,26 @@ namespace Clara_bot.Commands
 
             while (true)
             {
-                await Task.Delay(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
+                var playbackEvent = await _playbackEvents
+                    .WaitAsync(guildId, TimeSpan.FromSeconds(16), cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (IsTerminalPlaybackFailure(playbackEvent) &&
+                    IsPlaybackEventForTrack(playbackEvent, legacyIdentifier))
+                {
+                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Lavalink {playbackEvent.Kind} guild {guildId}, track {playbackEvent.TrackIdentifier}: {SummarizePlaybackError(playbackEvent.Error)}");
+                    await NotifyPlaylistIssueAsync(
+                        guildId,
+                        $"⚠️ Không thể phát **{trackTitle}** từ URL YouTube đã chọn ({(playbackEvent.Kind == PlaybackEventKind.Stuck ? "track bị kẹt" : "YouTube từ chối stream")}).")
+                        .ConfigureAwait(false);
+
+                    // This callback is definitive. Mark the attempt as failed
+                    // so the queue advances (or disconnects) without replaying
+                    // the same unplayable URL through the legacy retry path.
+                    hasObservedTrackStart = true;
+                    observedTrackStartAt = DateTimeOffset.UtcNow - TimeSpan.FromSeconds(10);
+                    legacyFallbackAttempted = true;
+                }
 
                 ILavalinkPlayer? player;
                 try
@@ -572,7 +596,7 @@ namespace Clara_bot.Commands
                     if (!hasObservedTrackStart)
                     {
                         nullTicksBeforeStart++;
-                        if (nullTicksBeforeStart >= 8)
+                        if (nullTicksBeforeStart >= 1)
                         {
                             if (!legacyFallbackAttempted)
                             {
@@ -585,7 +609,7 @@ namespace Clara_bot.Commands
                                     await player.PlayAsync(legacyTrack).ConfigureAwait(false);
                                     await NotifyPlaylistIssueAsync(
                                         guildId,
-                                        $"⚠️ Nguồn chính lỗi với **{trackTitle}**; đang chuyển sang YouTube dự phòng.")
+                                        $"⚠️ URL đã chọn bị lỗi với **{trackTitle}**; đang thử phát lại cùng URL.")
                                         .ConfigureAwait(false);
                                     trackUri = legacyIdentifier;
                                     nullTicksBeforeStart = 0;
@@ -596,7 +620,7 @@ namespace Clara_bot.Commands
                             }
 
                             _playbackRouter.Reset(guildId);
-                            await NotifyPlaylistIssueAsync(guildId, $"⚠️ Không thể phát bài **{trackTitle}** vì cả YouTube và nguồn dự phòng đều thất bại.").ConfigureAwait(false);
+                            await NotifyPlaylistIssueAsync(guildId, $"⚠️ Không thể phát bài **{trackTitle}** sau khi đã thử lại URL đã chọn.").ConfigureAwait(false);
                             await player.DisconnectAsync().ConfigureAwait(false);
                             return;
                         }
@@ -621,7 +645,7 @@ namespace Clara_bot.Commands
                                 await player.PlayAsync(legacyTrack).ConfigureAwait(false);
                                 await NotifyPlaylistIssueAsync(
                                     guildId,
-                                    $"⚠️ Nguồn chính dừng sớm với **{trackTitle}**; đang chuyển sang YouTube dự phòng.")
+                                    $"⚠️ URL đã chọn dừng sớm với **{trackTitle}**; đang thử phát lại cùng URL.")
                                     .ConfigureAwait(false);
                                 trackUri = legacyIdentifier;
                                 hasObservedTrackStart = false;
@@ -798,15 +822,34 @@ namespace Clara_bot.Commands
 
                 string? identifier;
                 string title = "Không rõ tiêu đề";
+                bool waitingForItems;
+                bool hasItem;
                 lock (queue)
                 {
                     if (index >= queue.Items.Count)
                     {
-                        break;
+                        waitingForItems = queue.PendingLoaders > 0;
+                        hasItem = false;
+                        identifier = null;
                     }
+                    else
+                    {
+                        waitingForItems = false;
+                        hasItem = true;
+                        identifier = queue.Items[index].Identifier;
+                        title = queue.Items[index].Title;
+                    }
+                }
 
-                    identifier = queue.Items[index].Identifier;
-                    title = queue.Items[index].Title;
+                if (waitingForItems)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+
+                if (!hasItem)
+                {
+                    break;
                 }
 
                 if (string.IsNullOrWhiteSpace(identifier))
@@ -826,6 +869,7 @@ namespace Clara_bot.Commands
                     return;
                 }
 
+                _playbackEvents.Reset(guildId);
                 var primary = await _playbackRouter
                     .PlayPrimaryAsync(guildId, identifier, title, player, cancellationToken)
                     .ConfigureAwait(false);
@@ -840,7 +884,7 @@ namespace Clara_bot.Commands
                     {
                         await NotifyPlaylistIssueAsync(
                             guildId,
-                            $"⚠️ Bỏ qua bài {index + 1}: **{title}** vì cả nguồn chính và YouTube dự phòng đều không tải được.")
+                            $"⚠️ Bỏ qua bài {index + 1}: **{title}** vì URL đã chọn không tải được sau khi thử lại.")
                             .ConfigureAwait(false);
                         lock (queue)
                         {
@@ -854,7 +898,7 @@ namespace Clara_bot.Commands
                     await player.PlayAsync(legacyTrack).ConfigureAwait(false);
                     await NotifyPlaylistIssueAsync(
                         guildId,
-                        $"⚠️ Nguồn chính không có **{title}**; đang dùng YouTube dự phòng.")
+                        $"⚠️ Lần phát đầu thất bại với **{title}**; đã thử lại cùng URL.")
                         .ConfigureAwait(false);
                 }
                 var hasObservedTrackStart = false;
@@ -865,7 +909,50 @@ namespace Clara_bot.Commands
 
                 while (true)
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
+                    var playbackEvent = await _playbackEvents
+                        .WaitAsync(guildId, TimeSpan.FromSeconds(16), cancellationToken)
+                        .ConfigureAwait(false);
+
+                    if (IsTerminalPlaybackFailure(playbackEvent) &&
+                        IsPlaybackEventForTrack(playbackEvent, identifier))
+                    {
+                        var failureReason = playbackEvent.Kind == PlaybackEventKind.Stuck
+                            ? "track bị kẹt và vượt quá ngưỡng của Lavalink."
+                            : "YouTube từ chối cung cấp audio stream cho video đã chọn.";
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Lavalink {playbackEvent.Kind} guild {guildId}, track {playbackEvent.TrackIdentifier}: {SummarizePlaybackError(playbackEvent.Error)}");
+
+                        var stopPlaylist = await RegisterPlaylistPlaybackFailureAsync(
+                            guildId,
+                            queue,
+                            index,
+                            title,
+                            failureReason)
+                            .ConfigureAwait(false);
+                        if (stopPlaylist)
+                        {
+                            PlaybackQueues.TryRemove(guildId, out _);
+                            try
+                            {
+                                await player.DisconnectAsync().ConfigureAwait(false);
+                            }
+                            catch (Exception disconnectException)
+                            {
+                                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Không thể ngắt player guild {guildId} sau chuỗi lỗi: {disconnectException.Message}");
+                            }
+                            return;
+                        }
+
+                        lock (queue)
+                        {
+                            queue.Index = index + 1;
+                            queue.RequestedIndex = queue.Index;
+                        }
+
+                        // TrackException is terminal for this selected URL. Do
+                        // not replay it: the following TrackEnded callback is
+                        // stale and will be drained before the next item starts.
+                        break;
+                    }
 
                     if (!PlaybackQueues.TryGetValue(guildId, out queue))
                     {
@@ -901,7 +988,7 @@ namespace Clara_bot.Commands
                         if (!hasObservedTrackStart)
                         {
                             nullTicksBeforeStart++;
-                            if (nullTicksBeforeStart >= 15)
+                            if (nullTicksBeforeStart >= 1)
                             {
                                 if (!legacyFallbackAttempted)
                                 {
@@ -914,7 +1001,7 @@ namespace Clara_bot.Commands
                                         await player.PlayAsync(legacyTrack).ConfigureAwait(false);
                                         await NotifyPlaylistIssueAsync(
                                             guildId,
-                                            $"⚠️ Nguồn chính lỗi với **{title}**; đang chuyển sang YouTube dự phòng.")
+                                            $"⚠️ URL đã chọn bị lỗi với **{title}**; đang thử phát lại cùng URL.")
                                             .ConfigureAwait(false);
                                         hasObservedTrackStart = false;
                                         nowPlayingNotified = false;
@@ -968,7 +1055,7 @@ namespace Clara_bot.Commands
                                     await player.PlayAsync(legacyTrack).ConfigureAwait(false);
                                     await NotifyPlaylistIssueAsync(
                                         guildId,
-                                        $"⚠️ Nguồn chính dừng sớm với **{title}**; đang chuyển sang YouTube dự phòng.")
+                                        $"⚠️ URL đã chọn dừng sớm với **{title}**; đang thử phát lại cùng URL.")
                                         .ConfigureAwait(false);
                                     hasObservedTrackStart = false;
                                     nowPlayingNotified = false;
@@ -1066,6 +1153,135 @@ namespace Clara_bot.Commands
             }
         }
 
+        private async Task LoadRemainingSpotifyPlaylistTracksAsync(
+            ulong guildId,
+            PlaybackQueue targetQueue,
+            IReadOnlyList<SpotifyTrackInfo> spotifyTracks,
+            IUserMessage statusMessage,
+            CancellationToken cancellationToken)
+        {
+            var addedCount = 0;
+            try
+            {
+                for (var index = 1; index < spotifyTracks.Count; index++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (!PlaybackQueues.TryGetValue(guildId, out var currentQueue) ||
+                        !ReferenceEquals(currentQueue, targetQueue))
+                    {
+                        return;
+                    }
+
+                    var spotifyTrack = spotifyTracks[index];
+                    if (string.IsNullOrWhiteSpace(spotifyTrack.SearchQuery))
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        var youtubeTrack = await ResolveSpotifyTrackOnYouTubeAsync(spotifyTrack)
+                            .ConfigureAwait(false);
+                        if (youtubeTrack is null)
+                        {
+                            continue;
+                        }
+
+                        lock (targetQueue)
+                        {
+                            targetQueue.Items.Add(youtubeTrack);
+                        }
+
+                        addedCount++;
+                    }
+                    catch (Exception exception)
+                    {
+                        Console.WriteLine($"[Spotify link] Bỏ qua track {index + 1}: {exception.Message}");
+                    }
+                }
+
+                try
+                {
+                    await statusMessage.ModifyAsync(message =>
+                        message.Content = $"✅ Đã bổ sung {addedCount} bài hát vào queue.").ConfigureAwait(false);
+                }
+                catch
+                {
+                    // The status message may have been deleted while loading.
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // A newer play/stop command replaced this playlist.
+            }
+            finally
+            {
+                lock (targetQueue)
+                {
+                    targetQueue.PendingLoaders = Math.Max(0, targetQueue.PendingLoaders - 1);
+                }
+            }
+        }
+
+        private async Task<QueueItem?> ResolveSpotifyTrackOnYouTubeAsync(SpotifyTrackInfo spotifyTrack)
+        {
+            var queries = new[]
+            {
+                spotifyTrack.SearchQuery,
+                string.IsNullOrWhiteSpace(spotifyTrack.Artist)
+                    ? spotifyTrack.Title
+                    : $"{spotifyTrack.Title} {spotifyTrack.Artist}",
+                spotifyTrack.Title,
+            }
+            .Where(query => !string.IsNullOrWhiteSpace(query))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var query in queries)
+            {
+                foreach (var (identifier, searchMode) in new[]
+                {
+                    (query, TrackSearchMode.YouTube),
+                    ($"ytsearch:{query}", TrackSearchMode.None),
+                })
+                {
+                    try
+                    {
+                        var track = await _audioService.Tracks
+                            .LoadTrackAsync(identifier, searchMode)
+                            .ConfigureAwait(false);
+                        if (track is null)
+                        {
+                            continue;
+                        }
+
+                        var youtubeUrl = track.Uri?.ToString();
+                        if (string.IsNullOrWhiteSpace(youtubeUrl) && !string.IsNullOrWhiteSpace(track.Identifier))
+                        {
+                            youtubeUrl = $"https://www.youtube.com/watch?v={track.Identifier}";
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(youtubeUrl))
+                        {
+                            return new QueueItem
+                            {
+                                Identifier = youtubeUrl,
+                                Title = string.IsNullOrWhiteSpace(track.Title)
+                                    ? $"{spotifyTrack.Title} - {spotifyTrack.Artist}".Trim(' ', '-')
+                                    : track.Title,
+                            };
+                        }
+                    }
+                    catch (Exception exception)
+                    {
+                        Console.WriteLine($"[Spotify → YouTube] Search lỗi với '{identifier}': {exception.Message}");
+                    }
+                }
+            }
+
+            Console.WriteLine($"[Spotify → YouTube] Không có kết quả cho: {spotifyTrack.Title} - {spotifyTrack.Artist}");
+            return null;
+        }
+
         [Command("queueclara")]
         [Alias("queue")]
         [Summary("Bật/tắt chế độ hàng chờ. Khi bật, /play sẽ thêm bài vào playlist thay vì ghi đè.")]
@@ -1135,6 +1351,7 @@ namespace Clara_bot.Commands
             player.Filters.Timescale = null;
             await player.Filters.CommitAsync().ConfigureAwait(false);
 
+            _playbackEvents.Reset(Context.Guild.Id);
             var primary = await _playbackRouter
                 .PlayPrimaryAsync(Context.Guild.Id, identifier, title, player, playbackToken)
                 .ConfigureAwait(false);
@@ -1148,13 +1365,13 @@ namespace Clara_bot.Commands
                     .ConfigureAwait(false);
                 if (legacyTrack is null)
                 {
-                    await ReplyAsync($"❌ Không thể tải bài hát từ nguồn chính hoặc YouTube dự phòng: **{title}**");
+                    await ReplyAsync($"❌ Không thể tải bài hát từ URL đã chọn sau khi thử lại: **{title}**");
                     return;
                 }
 
                 await player.PlayAsync(legacyTrack).ConfigureAwait(false);
                 activeTrackUri = identifier;
-                await ReplyAsync($"⚠️ Nguồn chính không có **{title}**; đang dùng YouTube dự phòng.");
+                await ReplyAsync($"⚠️ Lần phát đầu thất bại với **{title}**; đã thử lại cùng URL.");
             }
 
             await ReplyAsync($"▶️ Đang phát: **{title}**");
@@ -1435,105 +1652,87 @@ namespace Clara_bot.Commands
                     return;
                 }
 
-                // Xử lý link Spotify
+                // Spotify links only provide public title/artist metadata.
+                // The audio source is always the matching YouTube result.
                 if (isUrl && uri is not null && SpotifyService.IsSpotifyUrl(query))
                 {
-                    // Spotify playlist/album
+                    // Convert every public Spotify playlist/album entry into a
+                    // YouTube result, then hand the result to the normal queue.
                     if (SpotifyService.IsSpotifyPlaylist(query))
                     {
                         var spotifyTracks = await SpotifyService.GetPlaylistTracksAsync(query);
                         if (spotifyTracks.Count == 0)
                         {
-                            await ReplyAsync("❌ Không thể lấy danh sách bài hát từ Spotify.");
+                            await ReplyAsync("❌ Không thể đọc danh sách bài hát công khai từ link Spotify.");
                             return;
                         }
 
-                        await ReplyAsync($"🎵 Đã nhận playlist từ Spotify: {spotifyTracks.Count} bài. Đang tìm trên YouTube...");
-
-                        if (spotifyTracks.Count == 1)
+                        var statusMsg = await ReplyAsync("🔄 Đang loading các bài hát trong playlist để bổ sung đầy đủ cho queue...");
+                        var firstSpotifyTrack = spotifyTracks[0];
+                        var firstYoutubeTrack = await ResolveSpotifyTrackOnYouTubeAsync(firstSpotifyTrack);
+                        if (firstYoutubeTrack is null)
                         {
-                            var sq = spotifyTracks[0].SearchQuery;
-                            if (!string.IsNullOrWhiteSpace(sq))
-                            {
-                                var ytTrack = await _audioService.Tracks.LoadTrackAsync(sq, TrackSearchMode.YouTube);
-                                if (ytTrack?.Uri is not null)
-                                {
-                                    if (keepQueue)
-                                    {
-                                        string yid = ytTrack.Uri.ToString();
-                                        string ytName = ytTrack.Title ?? spotifyTracks[0].Title;
-                                        await AddToQueueOrPlayNowAsync(yid, ytName, player, playbackToken);
-                                    }
-                                    else
-                                    {
-                                        var ytUri = ytTrack.Uri?.ToString() ?? string.Empty;
-                                        var ytTitle = ytTrack.Title ?? spotifyTracks[0].Title;
-                                        if (!string.IsNullOrWhiteSpace(ytUri))
-                                        {
-                                            await PlayTrackImmediatelyAsync(ytUri, ytTitle, player, playbackToken);
-                                        }
-                                    }
-                                    return;
-                                }
-                            }
-                            await ReplyAsync("❌ Không tìm thấy playlist trên YouTube.");
+                            await statusMsg.ModifyAsync(message =>
+                                message.Content = "❌ Không tìm thấy bài đầu tiên của playlist trên YouTube.");
                             return;
                         }
 
-                        // Multiple tracks: queue them up and play
-                        var queueItems = new List<QueueItem>();
-                        var statusMsg = await ReplyAsync($"🔄 Đang tải 0/{spotifyTracks.Count} bài...");
-                        for (int i = 0; i < spotifyTracks.Count; i++)
+                        var firstQueueItem = new QueueItem
                         {
-                            if (string.IsNullOrWhiteSpace(spotifyTracks[i].SearchQuery)) continue;
-                            try
-                            {
-                                var ytTrack = await _audioService.Tracks.LoadTrackAsync(spotifyTracks[i].SearchQuery, TrackSearchMode.YouTube);
-                                if (ytTrack?.Uri is not null)
-                                    queueItems.Add(new QueueItem { Identifier = ytTrack.Uri.ToString(), Title = ytTrack.Title ?? $"{spotifyTracks[i].Title} - {spotifyTracks[i].Artist}" });
-                            }
-                            catch { }
-                            if ((i + 1) % 5 == 0 || i == spotifyTracks.Count - 1)
-                                try { await statusMsg.ModifyAsync(m => m.Content = $"🔄 Đang tải {i + 1}/{spotifyTracks.Count} bài..."); } catch { }
-                        }
+                            Identifier = firstYoutubeTrack.Identifier,
+                            Title = firstYoutubeTrack.Title,
+                        };
 
-                        if (queueItems.Count == 0)
-                        {
-                            await ReplyAsync("❌ Không tìm thấy bài hát nào từ playlist Spotify trên YouTube.");
-                            return;
-                        }
-
+                        PlaybackQueue targetQueue;
                         if (keepQueue && PlaybackQueues.TryGetValue(Context.Guild.Id, out var sq2))
                         {
-                            lock (sq2) { sq2.Items.AddRange(queueItems); }
-                            try { await statusMsg.ModifyAsync(m => m.Content = $"✅ Đã thêm {queueItems.Count} bài vào hàng chờ."); } catch { }
+                            targetQueue = sq2;
+                            lock (targetQueue)
+                            {
+                                targetQueue.Items.Add(firstQueueItem);
+                                targetQueue.PendingLoaders++;
+                            }
                         }
                         else
                         {
-                            PlaybackQueues[Context.Guild.Id] = new PlaybackQueue { Items = queueItems, TextChannelId = Context.Channel.Id, Index = 0, RequestedIndex = 0 };
-                            try { await statusMsg.ModifyAsync(m => m.Content = $"📃 Đã tìm thấy {queueItems.Count} bài. Bắt đầu phát..."); } catch { }
+                            targetQueue = new PlaybackQueue
+                            {
+                                Items = new List<QueueItem> { firstQueueItem },
+                                TextChannelId = Context.Channel.Id,
+                                Index = 0,
+                                RequestedIndex = 0,
+                                PendingLoaders = 1,
+                            };
+                            PlaybackQueues[Context.Guild.Id] = targetQueue;
                             _ = Task.Run(() => PlayPlaylistAsync(Context.Guild.Id, playbackToken), playbackToken);
                         }
+
+                        _ = Task.Run(
+                            () => LoadRemainingSpotifyPlaylistTracksAsync(
+                                Context.Guild.Id,
+                                targetQueue,
+                                spotifyTracks,
+                                statusMsg,
+                                playbackToken),
+                            playbackToken);
                         return;
                     }
 
-                    // Spotify single track
+                    // Resolve a single Spotify track name, then play YouTube.
                     var spotifyInfo = await SpotifyService.GetTrackInfoAsync(query);
                     if (spotifyInfo is not null)
                     {
-                        var spotifyTrack = await _audioService.Tracks.LoadTrackAsync(spotifyInfo.SearchQuery, TrackSearchMode.YouTube);
+                        var spotifyTrack = await ResolveSpotifyTrackOnYouTubeAsync(spotifyInfo);
                         if (spotifyTrack is not null)
                         {
-                            var spotifyId = spotifyTrack.Uri?.ToString() ?? string.Empty;
-                            var spotifyTitle = string.IsNullOrWhiteSpace(spotifyTrack.Title) ? "Không rõ tiêu đề" : spotifyTrack.Title;
-                            await AddToQueueOrPlayNowAsync(spotifyId, spotifyTitle, player, playbackToken);
+                            await AddToQueueOrPlayNowAsync(spotifyTrack.Identifier, spotifyTrack.Title, player, playbackToken);
                             return;
                         }
-                        await ReplyAsync("❌ Không tìm thấy bài hát tương ứng trên YouTube.");
+                        await ReplyAsync("❌ Không tìm thấy bài hát YouTube tương ứng.");
                         return;
                     }
 
-                    await ReplyAsync("❌ Không thể lấy thông tin từ link Spotify.");
+                    await ReplyAsync("❌ Không thể đọc tên bài hát từ link Spotify công khai.");
                     return;
                 }
 
@@ -1897,6 +2096,9 @@ namespace Clara_bot.Commands
             var uri = track.Uri?.ToString() ?? track.Identifier;
             var duration = track.Duration;
             var position = player.Position?.Position ?? TimeSpan.Zero;
+            var voiceChannel = _client.GetGuild(guildId)?.CurrentUser.VoiceChannel;
+            var channelBitrateKbps = voiceChannel is null ? 0 : voiceChannel.Bitrate / 1000;
+            var qualityLabel = GetDiscordAudioQualityLabel(channelBitrateKbps);
 
             var embed = new EmbedBuilder()
                 .WithTitle("🎵 Thông tin bài hát đang phát")
@@ -1904,10 +2106,26 @@ namespace Clara_bot.Commands
                 .AddField("Tác giả", author, false)
                 .AddField("Thời lượng", FormatDuration(duration), true)
                 .AddField("Đã phát", FormatDuration(position), true)
+                .AddField("Chất lượng Discord", qualityLabel, true)
+                .AddField("Bitrate voice", channelBitrateKbps > 0 ? $"{channelBitrateKbps} kbps" : "Không xác định", true)
+                .AddField("Server Boost", Context.Guild.PremiumTier.ToString(), true)
+                .WithFooter("Lavalink: Opus quality 10/10 • Resampling HIGH • 48 kHz stereo")
                 .WithUrl(uri)
                 .WithColor(Color.Purple);
 
             await ReplyAsync(embed: embed.Build());
+        }
+
+        private static string GetDiscordAudioQualityLabel(int bitrateKbps)
+        {
+            return bitrateKbps switch
+            {
+                <= 0 => "Không xác định",
+                <= 96 => "Tiêu chuẩn (tối đa 96 kbps)",
+                <= 128 => "Boost Level 1 (tối đa 128 kbps)",
+                <= 256 => "Boost Level 2 (tối đa 256 kbps)",
+                _ => "Boost Level 3 (tối đa 384 kbps)",
+            };
         }
 
         private static string FormatDuration(TimeSpan duration)
@@ -1915,6 +2133,58 @@ namespace Clara_bot.Commands
             if (duration.TotalHours >= 1)
                 return duration.ToString(@"h\:mm\:ss");
             return duration.ToString(@"m\:ss");
+        }
+
+        private static string SummarizePlaybackError(string? error)
+        {
+            if (string.IsNullOrWhiteSpace(error))
+            {
+                return "Không có chi tiết từ Lavalink.";
+            }
+
+            var firstLine = error.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                .FirstOrDefault()?.Trim() ?? error.Trim();
+            return firstLine.Length <= 240 ? firstLine : firstLine[..240] + "…";
+        }
+
+        private static bool IsTerminalPlaybackFailure(PlaybackEvent playbackEvent) =>
+            playbackEvent.Kind is PlaybackEventKind.Exception or PlaybackEventKind.Stuck ||
+            playbackEvent.Kind == PlaybackEventKind.Ended && playbackEvent.EndReason == TrackEndReason.LoadFailed;
+
+        private static bool IsPlaybackEventForTrack(PlaybackEvent playbackEvent, string expectedIdentifier)
+        {
+            if (string.IsNullOrWhiteSpace(playbackEvent.TrackIdentifier))
+            {
+                return true;
+            }
+
+            var expectedVideoId = ExtractYouTubeVideoId(expectedIdentifier);
+            return string.IsNullOrWhiteSpace(expectedVideoId) ||
+                   string.Equals(expectedVideoId, playbackEvent.TrackIdentifier, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string? ExtractYouTubeVideoId(string identifier)
+        {
+            if (!Uri.TryCreate(identifier, UriKind.Absolute, out var uri) || !IsYouTubeUrl(uri))
+            {
+                return null;
+            }
+
+            if (uri.Host.Contains("youtu.be", StringComparison.OrdinalIgnoreCase))
+            {
+                return uri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+            }
+
+            foreach (var part in uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var pair = part.Split('=', 2);
+                if (pair.Length == 2 && string.Equals(pair[0], "v", StringComparison.OrdinalIgnoreCase))
+                {
+                    return Uri.UnescapeDataString(pair[1]);
+                }
+            }
+
+            return null;
         }
 
         [Command("showplaylistclara", RunMode = RunMode.Async)]

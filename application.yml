@@ -9,29 +9,44 @@ plugins:
     allowDirectVideoIds: true
     allowDirectPlaylistIds: true
     clients:
-      # Anonymous clients first; TV must not be first when remoteCipher is enabled.
-      - MWEB
+      # Keep several playback-capable clients because YouTube may reject one
+      # while another still returns a usable audio format.
+      - ANDROID_VR
+      - ANDROID_MUSIC
+      - IOS
       - WEB
-      # The only youtube-source client that supports OAuth playback.
+      - WEBEMBEDDED
+      - MWEB
+      - TVHTML5_SIMPLY
+      # MUSIC is search-only; keep it for ytmsearch metadata resolution.
+      - MUSIC
+      # TV uses OAuth after the device authorization flow is completed.
       - TV
 
     # YouTube is rejecting anonymous playback from this IP. Use a dedicated
     # account: high traffic can rate-limit or terminate the authenticated account.
     oauth:
       enabled: true
-      refreshToken: "${YOUTUBE_REFRESH_TOKEN:}"
-      skipInitialization: true
+      # Chưa có refresh token: Lavalink sẽ in URL + device code để hoàn tất
+      # OAuth khi khởi động. Chỉ thêm refreshToken và skipInitialization sau
+      # khi đã nhận được một refresh token hợp lệ.
 
-    # Public yt-cipher currently allows 10 requests/second (documented as
-    # sufficient for roughly 1,000 active players). For production-grade
-    # availability, replace this URL with a self-hosted yt-cipher instance.
+    # Shared cipher service used when YouTube changes its player scripts.
     remoteCipher:
       url: "https://cipher.kikkia.dev/"
-      userAgent: "ClaraBot/1.1.1"
+      userAgent: "ClaraBot/1.2.0"
 
 lavalink:
   server:
     password: "youshallnotpass"
+    # High-fidelity profile. Discord still applies the bitrate configured on
+    # each voice channel (normally 96/128/256/384 kbps by boost tier).
+    opusEncodingQuality: 10
+    resamplingQuality: HIGH
+    bufferDurationMs: 800
+    frameBufferDurationMs: 5000
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
     timeouts:
       connectTimeoutMs: 10000
       connectionRequestTimeoutMs: 10000

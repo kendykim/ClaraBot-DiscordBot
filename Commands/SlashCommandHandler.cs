@@ -95,10 +95,10 @@ namespace Clara_bot.Commands
 
                 new SlashCommandBuilder()
                     .WithName("play")
-                    .WithDescription("Phát nhạc từ YouTube (/playclara)")
+                    .WithDescription("Phát YouTube; hỗ trợ tìm theo link Spotify (/playclara)")
                     .AddOption(new SlashCommandOptionBuilder()
                         .WithName("query")
-                        .WithDescription("Link YouTube hoặc tên bài hát")
+                        .WithDescription("Tên bài, link YouTube hoặc link track/playlist Spotify")
                         .WithType(ApplicationCommandOptionType.String)
                         .WithRequired(true)),
 

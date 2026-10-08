@@ -6,13 +6,13 @@ using Lavalink4NET.Rest.Entities.Tracks;
 namespace Clara_bot.Commands;
 
 /// <summary>
-/// Routes playback through the preferred audio source with bounded retries and
-/// isolated per-guild state. It reuses Lavalink4NET's existing Discord voice
-/// connection and leaves the original identifier available for legacy fallback.
+/// Plays the exact URL selected by the command with bounded retries and
+/// isolated per-guild state. It never changes providers implicitly: YouTube
+/// stays YouTube, and SoundCloud is used only for an explicit SoundCloud URL.
 /// </summary>
 public sealed class ResilientPlaybackRouter
 {
-    private static readonly string[] QuerySuffixes = [string.Empty, " official audio", " audio"];
+    private const int MaxAttempts = 3;
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(500);
 
     private readonly IAudioService _audioService;
@@ -57,15 +57,14 @@ public sealed class ResilientPlaybackRouter
                 state.NextAttempt = 0;
             }
 
-            while (state.NextAttempt < QuerySuffixes.Length)
+            while (state.NextAttempt < MaxAttempts)
             {
                 var attempt = state.NextAttempt++;
-                var query = title + QuerySuffixes[attempt];
 
                 try
                 {
                     var track = await _audioService.Tracks
-                        .LoadTrackAsync(query, TrackSearchMode.SoundCloud)
+                        .LoadTrackAsync(playbackKey, TrackSearchMode.None)
                         .ConfigureAwait(false);
 
                     if (track is null)
@@ -78,7 +77,7 @@ public sealed class ResilientPlaybackRouter
                     return new PlaybackRouteResult(
                         true,
                         attempt + 1,
-                        query,
+                        playbackKey,
                         track.Uri?.ToString());
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
